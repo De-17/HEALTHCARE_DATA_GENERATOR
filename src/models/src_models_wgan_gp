@@ -1,0 +1,302 @@
+"""
+Wasserstein GAN with Gradient Penalty (WGAN-GP) for Healthcare Data
+Privacy-preserving implementation with differential privacy
+"""
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.autograd as autograd
+import numpy as np
+from typing import Dict, Optional
+from tqdm import tqdm
+
+class Generator(nn.Module):
+    """Generator network for WGAN-GP"""
+    
+    def __init__(self, noise_dim: int, output_dim: int, hidden_dims: list = [256, 512, 256]):
+        super(Generator, self).__init__()
+        
+        layers = []
+        input_dim = noise_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(input_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.2)
+            ])
+            input_dim = hidden_dim
+        
+        layers.append(nn.Linear(input_dim, output_dim))
+        layers.append(nn.Tanh())
+        
+        self.model = nn.Sequential(*layers)
+    
+    def forward(self, noise):
+        return self.model(noise)
+
+
+class Discriminator(nn.Module):
+    """Discriminator network for WGAN-GP"""
+    
+    def __init__(self, input_dim: int, hidden_dims: list = [256, 512, 256]):
+        super(Discriminator, self).__init__()
+        
+        layers = []
+        current_dim = input_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(current_dim, hidden_dim),
+                nn.LeakyReLU(0.2, inplace=True),
+                nn.Dropout(0.3)
+            ])
+            current_dim = hidden_dim
+        
+        layers.append(nn.Linear(current_dim, 1))
+        
+        self.model = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.model(x)
+
+
+class WGAN_GP:
+    """
+    Wasserstein GAN with Gradient Penalty for synthetic healthcare data generation
+    """
+    
+    def __init__(
+        self,
+        input_dim: int,
+        noise_dim: int = 128,
+        privacy_params: Dict[str, float] = None,
+        device: str = None
+    ):
+        self.input_dim = input_dim
+        self.noise_dim = noise_dim
+        self.privacy_params = privacy_params or {'epsilon': 1.0, 'delta': 1e-5}
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Initialize networks
+        self.generator = Generator(noise_dim, input_dim).to(self.device)
+        self.discriminator = Discriminator(input_dim).to(self.device)
+        
+        # Optimizers
+        self.g_optimizer = optim.Adam(self.generator.parameters(), lr=0.0001, betas=(0.5, 0.9))
+        self.d_optimizer = optim.Adam(self.discriminator.parameters(), lr=0.0001, betas=(0.5, 0.9))
+        
+        # Training parameters
+        self.lambda_gp = 10  # Gradient penalty coefficient
+        self.n_critic = 5    # Train discriminator n times per generator training
+        
+        print(f"🧠 WGAN-GP initialized on {self.device}")
+        print(f"🔒 Privacy: ε={self.privacy_params['epsilon']}, δ={self.privacy_params['delta']}")
+    
+    def gradient_penalty(self, real_data, fake_data):
+        """Calculate gradient penalty for WGAN-GP"""
+        batch_size = real_data.size(0)
+        
+        # Random weight term for interpolation
+        alpha = torch.rand(batch_size, 1, device=self.device)
+        alpha = alpha.expand_as(real_data)
+        
+        # Interpolated samples
+        interpolated = alpha * real_data + (1 - alpha) * fake_data
+        interpolated = interpolated.to(self.device)
+        interpolated.requires_grad_(True)
+        
+        # Calculate probability of interpolated examples
+        prob_interpolated = self.discriminator(interpolated)
+        
+        # Calculate gradients
+        gradients = autograd.grad(
+            outputs=prob_interpolated,
+            inputs=interpolated,
+            grad_outputs=torch.ones(prob_interpolated.size(), device=self.device),
+            create_graph=True,
+            retain_graph=True
+        )[0]
+        
+        # Gradient penalty
+        gradients_norm = torch.sqrt(torch.sum(gradients ** 2, dim=1) + 1e-12)
+        gradient_penalty = ((gradients_norm - 1) ** 2).mean()
+        
+        return gradient_penalty
+    
+    def add_dp_noise(self, gradients, sensitivity: float = 1.0):
+        """Add differential privacy noise to gradients"""
+        epsilon = self.privacy_params['epsilon']
+        noise_scale = sensitivity / epsilon
+        
+        for param in gradients:
+            if param.grad is not None:
+                noise = torch.normal(0, noise_scale, size=param.grad.shape, device=self.device)
+                param.grad += noise
+    
+    def fit(self, data: np.ndarray, epochs: int = 100, batch_size: int = 64):
+        """Train the WGAN-GP model"""
+        
+        # Convert to tensor
+        data_tensor = torch.FloatTensor(data).to(self.device)
+        dataset = torch.utils.data.TensorDataset(data_tensor)
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        
+        print(f"🚀 Training WGAN-GP for {epochs} epochs...")
+        
+        # Training metrics
+        g_losses = []
+        d_losses = []
+        
+        for epoch in tqdm(range(epochs), desc="Training"):
+            for i, (real_data,) in enumerate(dataloader):
+                real_data = real_data.to(self.device)
+                current_batch_size = real_data.size(0)
+                
+                # ================== Train Discriminator ==================
+                for _ in range(self.n_critic):
+                    self.d_optimizer.zero_grad()
+                    
+                    # Real data
+                    d_real = self.discriminator(real_data).mean()
+                    
+                    # Fake data
+                    noise = torch.randn(current_batch_size, self.noise_dim, device=self.device)
+                    fake_data = self.generator(noise)
+                    d_fake = self.discriminator(fake_data.detach()).mean()
+                    
+                    # Gradient penalty
+                    gp = self.gradient_penalty(real_data, fake_data)
+                    
+                    # Discriminator loss
+                    d_loss = d_fake - d_real + self.lambda_gp * gp
+                    d_loss.backward()
+                    
+                    # Apply differential privacy noise
+                    if self.privacy_params['epsilon'] < 5.0:
+                        self.add_dp_noise(self.discriminator.parameters())
+                    
+                    self.d_optimizer.step()
+                
+                # ================== Train Generator ==================
+                self.g_optimizer.zero_grad()
+                
+                # Generate fake data
+                noise = torch.randn(current_batch_size, self.noise_dim, device=self.device)
+                fake_data = self.generator(noise)
+                
+                # Generator loss
+                g_loss = -self.discriminator(fake_data).mean()
+                g_loss.backward()
+                
+                # Apply differential privacy noise
+                if self.privacy_params['epsilon'] < 5.0:
+                    self.add_dp_noise(self.generator.parameters())
+                
+                self.g_optimizer.step()
+                
+                # Store losses
+                if i % 10 == 0:
+                    g_losses.append(g_loss.item())
+                    d_losses.append(d_loss.item())
+            
+            # Print progress
+            if (epoch + 1) % 20 == 0:
+                print(f"Epoch [{epoch+1}/{epochs}] - G Loss: {g_loss.item():.4f}, D Loss: {d_loss.item():.4f}")
+        
+        print("✅ WGAN-GP training completed!")
+        return {'generator_losses': g_losses, 'discriminator_losses': d_losses}
+    
+    def generate(self, n_samples: int = 1000) -> np.ndarray:
+        """Generate synthetic healthcare data"""
+        
+        self.generator.eval()
+        synthetic_data = []
+        
+        with torch.no_grad():
+            # Generate in batches to avoid memory issues
+            batch_size = 500
+            n_batches = (n_samples + batch_size - 1) // batch_size
+            
+            for _ in range(n_batches):
+                current_batch_size = min(batch_size, n_samples - len(synthetic_data) * batch_size // batch_size)
+                
+                # Generate noise
+                noise = torch.randn(current_batch_size, self.noise_dim, device=self.device)
+                
+                # Generate fake data
+                fake_data = self.generator(noise)
+                synthetic_data.append(fake_data.cpu().numpy())
+        
+        synthetic_data = np.vstack(synthetic_data)[:n_samples]
+        
+        # Add post-generation privacy noise for high privacy
+        if self.privacy_params['epsilon'] < 1.0:
+            noise_scale = 0.01
+            noise = np.random.laplace(0, noise_scale, synthetic_data.shape)
+            synthetic_data += noise
+        
+        return synthetic_data
+    
+    def save(self, filepath: str):
+        """Save the trained model"""
+        torch.save({
+            'generator_state_dict': self.generator.state_dict(),
+            'discriminator_state_dict': self.discriminator.state_dict(),
+            'g_optimizer_state_dict': self.g_optimizer.state_dict(),
+            'd_optimizer_state_dict': self.d_optimizer.state_dict(),
+            'input_dim': self.input_dim,
+            'noise_dim': self.noise_dim,
+            'privacy_params': self.privacy_params
+        }, filepath)
+        
+        print(f"💾 WGAN-GP model saved to {filepath}")
+    
+    def load(self, filepath: str):
+        """Load a trained model"""
+        checkpoint = torch.load(filepath, map_location=self.device)
+        
+        self.generator.load_state_dict(checkpoint['generator_state_dict'])
+        self.discriminator.load_state_dict(checkpoint['discriminator_state_dict'])
+        self.g_optimizer.load_state_dict(checkpoint['g_optimizer_state_dict'])
+        self.d_optimizer.load_state_dict(checkpoint['d_optimizer_state_dict'])
+        
+        print(f"📂 WGAN-GP model loaded from {filepath}")
+
+
+# Example usage and testing
+if __name__ == "__main__":
+    # Create sample medical data
+    np.random.seed(42)
+    n_samples = 1000
+    n_features = 10
+    
+    # Simulate medical features (normalized)
+    real_data = np.random.randn(n_samples, n_features).astype(np.float32)
+    
+    # Add some correlations (like real medical data)
+    real_data[:, 1] = 0.7 * real_data[:, 0] + 0.3 * np.random.randn(n_samples)  # Correlated features
+    real_data[:, 5] = np.where(real_data[:, 0] > 0, 1, 0) + 0.1 * np.random.randn(n_samples)  # Binary-like
+    
+    print("🏥 Training WGAN-GP on synthetic medical data...")
+    print(f"Data shape: {real_data.shape}")
+    
+    # Initialize and train WGAN-GP
+    wgan = WGAN_GP(
+        input_dim=n_features,
+        privacy_params={'epsilon': 1.0, 'delta': 1e-5}
+    )
+    
+    # Train the model
+    training_history = wgan.fit(real_data, epochs=100, batch_size=64)
+    
+    # Generate synthetic data
+    synthetic_data = wgan.generate(n_samples=500)
+    
+    print(f"✅ Generated synthetic data shape: {synthetic_data.shape}")
+    print(f"Real data mean: {real_data.mean(axis=0)[:3]}")
+    print(f"Synthetic data mean: {synthetic_data.mean(axis=0)[:3]}")
+    print(f"Real data std: {real_data.std(axis=0)[:3]}")
+    print(f"Synthetic data std: {synthetic_data.std(axis=0)[:3]}")
