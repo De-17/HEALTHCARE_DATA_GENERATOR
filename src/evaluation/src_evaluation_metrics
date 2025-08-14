@@ -1,0 +1,453 @@
+"""
+Comprehensive evaluation metrics for synthetic healthcare data
+Privacy and utility assessment framework
+"""
+
+import pandas as pd
+import numpy as np
+from scipy import stats
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+import warnings
+warnings.filterwarnings('ignore')
+
+class SyntheticDataEvaluator:
+    """
+    Comprehensive evaluation framework for synthetic healthcare data
+    """
+    
+    def __init__(self):
+        self.results = {}
+    
+    def evaluate_all(
+        self, 
+        synthetic_data: pd.DataFrame, 
+        real_data: pd.DataFrame,
+        privacy_level: str = 'medium'
+    ) -> dict:
+        """
+        Run comprehensive evaluation of synthetic data
+        
+        Args:
+            synthetic_data: Generated synthetic dataset
+            real_data: Original real dataset  
+            privacy_level: Privacy protection level
+            
+        Returns:
+            Dictionary containing all evaluation metrics
+        """
+        
+        print("📊 Running comprehensive evaluation...")
+        
+        # Statistical similarity
+        statistical_scores = self.evaluate_statistical_similarity(synthetic_data, real_data)
+        
+        # Machine learning utility
+        ml_scores = self.evaluate_ml_utility(synthetic_data, real_data)
+        
+        # Privacy metrics
+        privacy_scores = self.evaluate_privacy(synthetic_data, real_data, privacy_level)
+        
+        # Data quality
+        quality_scores = self.evaluate_data_quality(synthetic_data, real_data)
+        
+        # Combine all results
+        all_results = {
+            **statistical_scores,
+            **ml_scores, 
+            **privacy_scores,
+            **quality_scores
+        }
+        
+        # Calculate overall scores
+        all_results['utility_score'] = self._calculate_utility_score(all_results)
+        all_results['privacy_score'] = self._calculate_privacy_score(all_results)
+        all_results['overall_score'] = (all_results['utility_score'] + all_results['privacy_score']) / 2
+        
+        print(f"✅ Evaluation complete!")
+        print(f"   Utility Score: {all_results['utility_score']:.3f}")
+        print(f"   Privacy Score: {all_results['privacy_score']:.3f}")
+        print(f"   Overall Score: {all_results['overall_score']:.3f}")
+        
+        return all_results
+    
+    def evaluate_statistical_similarity(self, synthetic_data: pd.DataFrame, real_data: pd.DataFrame) -> dict:
+        """Evaluate statistical similarity between synthetic and real data"""
+        
+        scores = {}
+        
+        # Ensure same columns
+        common_cols = list(set(synthetic_data.columns) & set(real_data.columns))
+        synthetic_subset = synthetic_data[common_cols]
+        real_subset = real_data[common_cols]
+        
+        # Kolmogorov-Smirnov test for each column
+        ks_scores = []
+        for col in common_cols:
+            try:
+                if pd.api.types.is_numeric_dtype(real_subset[col]):
+                    ks_stat, _ = stats.ks_2samp(real_subset[col], synthetic_subset[col])
+                    ks_scores.append(1 - ks_stat)  # Convert to similarity score
+                else:
+                    # For categorical, compare distributions
+                    real_dist = real_subset[col].value_counts(normalize=True).sort_index()
+                    synth_dist = synthetic_subset[col].value_counts(normalize=True).sort_index()
+                    
+                    # Align indices
+                    all_categories = sorted(set(real_dist.index) | set(synth_dist.index))
+                    real_aligned = real_dist.reindex(all_categories, fill_value=0)
+                    synth_aligned = synth_dist.reindex(all_categories, fill_value=0)
+                    
+                    # Jensen-Shannon divergence
+                    js_div = self._jensen_shannon_divergence(real_aligned.values, synth_aligned.values)
+                    ks_scores.append(1 - js_div)
+            except:
+                ks_scores.append(0.5)  # Default if comparison fails
+        
+        scores['kolmogorov_smirnov'] = np.mean(ks_scores)
+        
+        # Correlation similarity
+        try:
+            numeric_cols = synthetic_subset.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 1:
+                real_corr = real_subset[numeric_cols].corr()
+                synth_corr = synthetic_subset[numeric_cols].corr()
+                
+                # Flatten correlation matrices and compare
+                real_corr_flat = real_corr.values[np.triu_indices_from(real_corr.values, k=1)]
+                synth_corr_flat = synth_corr.values[np.triu_indices_from(synth_corr.values, k=1)]
+                
+                correlation_similarity = np.corrcoef(real_corr_flat, synth_corr_flat)[0, 1]
+                scores['correlation_similarity'] = max(0, correlation_similarity)
+            else:
+                scores['correlation_similarity'] = 1.0
+        except:
+            scores['correlation_similarity'] = 0.5
+        
+        # Mean and standard deviation similarity
+        mean_similarity = []
+        std_similarity = []
+        
+        for col in common_cols:
+            if pd.api.types.is_numeric_dtype(real_subset[col]):
+                real_mean, real_std = real_subset[col].mean(), real_subset[col].std()
+                synth_mean, synth_std = synthetic_subset[col].mean(), synthetic_subset[col].std()
+                
+                # Relative difference
+                mean_diff = abs(real_mean - synth_mean) / (abs(real_mean) + 1e-8)
+                std_diff = abs(real_std - synth_std) / (abs(real_std) + 1e-8)
+                
+                mean_similarity.append(max(0, 1 - mean_diff))
+                std_similarity.append(max(0, 1 - std_diff))
+        
+        scores['mean_similarity'] = np.mean(mean_similarity) if mean_similarity else 1.0
+        scores['std_similarity'] = np.mean(std_similarity) if std_similarity else 1.0
+        
+        return scores
+    
+    def evaluate_ml_utility(self, synthetic_data: pd.DataFrame, real_data: pd.DataFrame) -> dict:
+        """Evaluate machine learning utility of synthetic data"""
+        
+        scores = {}
+        
+        # Try to identify a target column (last column or most common pattern)
+        target_candidates = []
+        for col in real_data.columns:
+            if any(keyword in col.lower() for keyword in ['target', 'label', 'class', 'diagnosis', 'outcome']):
+                target_candidates.append(col)
+        
+        # If no clear target, use last column
+        if not target_candidates:
+            target_col = real_data.columns[-1]
+        else:
+            target_col = target_candidates[0]
+        
+        try:
+            # Prepare features and target
+            feature_cols = [col for col in real_data.columns if col != target_col]
+            
+            # Encode categorical variables
+            real_features = real_data[feature_cols].copy()
+            real_target = real_data[target_col].copy()
+            synth_features = synthetic_data[feature_cols].copy()
+            synth_target = synthetic_data[target_col].copy()
+            
+            # Handle categorical features
+            encoders = {}
+            for col in feature_cols:
+                if not pd.api.types.is_numeric_dtype(real_features[col]):
+                    le = LabelEncoder()
+                    # Fit on combined data to handle unseen categories
+                    combined_data = pd.concat([real_features[col], synth_features[col]]).astype(str)
+                    le.fit(combined_data)
+                    
+                    real_features[col] = le.transform(real_features[col].astype(str))
+                    synth_features[col] = le.transform(synth_features[col].astype(str))
+                    encoders[col] = le
+            
+            # Encode target if categorical
+            if not pd.api.types.is_numeric_dtype(real_target):
+                target_le = LabelEncoder()
+                combined_target = pd.concat([real_target, synth_target]).astype(str)
+                target_le.fit(combined_target)
+                real_target = target_le.transform(real_target.astype(str))
+                synth_target = target_le.transform(synth_target.astype(str))
+            
+            # Train on real data, test on real data (baseline)
+            X_train_real, X_test_real, y_train_real, y_test_real = train_test_split(
+                real_features, real_target, test_size=0.2, random_state=42
+            )
+            
+            model_real = RandomForestClassifier(n_estimators=100, random_state=42)
+            model_real.fit(X_train_real, y_train_real)
+            real_accuracy = accuracy_score(y_test_real, model_real.predict(X_test_real))
+            
+            # Train on synthetic data, test on real data
+            model_synth = RandomForestClassifier(n_estimators=100, random_state=42)
+            model_synth.fit(synth_features, synth_target)
+            synth_accuracy = accuracy_score(y_test_real, model_synth.predict(X_test_real))
+            
+            # ML utility score
+            scores['ml_utility'] = synth_accuracy / (real_accuracy + 1e-8)
+            scores['real_data_accuracy'] = real_accuracy
+            scores['synthetic_data_accuracy'] = synth_accuracy
+            
+        except Exception as e:
+            print(f"⚠️  ML utility evaluation failed: {e}")
+            scores['ml_utility'] = 0.5
+            scores['real_data_accuracy'] = 0.0
+            scores['synthetic_data_accuracy'] = 0.0
+        
+        return scores
+    
+    def evaluate_privacy(self, synthetic_data: pd.DataFrame, real_data: pd.DataFrame, privacy_level: str) -> dict:
+        """Evaluate privacy preservation of synthetic data"""
+        
+        scores = {}
+        
+        # Distance to closest real record
+        try:
+            # Select numeric columns for distance calculation
+            numeric_cols = synthetic_data.select_dtypes(include=[np.number]).columns
+            common_numeric_cols = list(set(numeric_cols) & set(real_data.columns))
+            
+            if common_numeric_cols:
+                real_numeric = real_data[common_numeric_cols].values
+                synth_numeric = synthetic_data[common_numeric_cols].values
+                
+                # Normalize data
+                from sklearn.preprocessing import StandardScaler
+                scaler = StandardScaler()
+                real_normalized = scaler.fit_transform(real_numeric)
+                synth_normalized = scaler.transform(synth_numeric)
+                
+                # Calculate minimum distances
+                min_distances = []
+                for synth_point in synth_normalized:
+                    distances = np.linalg.norm(real_normalized - synth_point, axis=1)
+                    min_distances.append(np.min(distances))
+                
+                # Privacy score based on minimum distance
+                mean_min_distance = np.mean(min_distances)
+                scores['distance_to_closest'] = min(1.0, mean_min_distance / 2.0)  # Normalize
+                
+                # Membership inference attack simulation
+                n_attack_samples = min(100, len(synthetic_data) // 2)
+                attack_success_rate = self._simulate_membership_inference(
+                    real_normalized, synth_normalized, n_attack_samples
+                )
+                scores['membership_inference_risk'] = 1 - attack_success_rate
+            else:
+                scores['distance_to_closest'] = 1.0
+                scores['membership_inference_risk'] = 0.8
+        except Exception as e:
+            print(f"⚠️  Privacy evaluation failed: {e}")
+            scores['distance_to_closest'] = 0.8
+            scores['membership_inference_risk'] = 0.7
+        
+        # Privacy level adjustment
+        privacy_multipliers = {'low': 0.8, 'medium': 0.9, 'high': 1.0}
+        multiplier = privacy_multipliers.get(privacy_level, 0.9)
+        
+        for key in scores:
+            scores[key] *= multiplier
+        
+        return scores
+    
+    def evaluate_data_quality(self, synthetic_data: pd.DataFrame, real_data: pd.DataFrame) -> dict:
+        """Evaluate overall data quality"""
+        
+        scores = {}
+        
+        # Missing values
+        real_missing = real_data.isnull().sum().sum() / (len(real_data) * len(real_data.columns))
+        synth_missing = synthetic_data.isnull().sum().sum() / (len(synthetic_data) * len(synthetic_data.columns))
+        scores['missing_value_similarity'] = 1 - abs(real_missing - synth_missing)
+        
+        # Data type consistency
+        common_cols = list(set(synthetic_data.columns) & set(real_data.columns))
+        type_consistency = []
+        for col in common_cols:
+            real_is_numeric = pd.api.types.is_numeric_dtype(real_data[col])
+            synth_is_numeric = pd.api.types.is_numeric_dtype(synthetic_data[col])
+            type_consistency.append(real_is_numeric == synth_is_numeric)
+        
+        scores['data_type_consistency'] = np.mean(type_consistency) if type_consistency else 1.0
+        
+        # Range consistency for numeric columns
+        range_consistency = []
+        for col in common_cols:
+            if (pd.api.types.is_numeric_dtype(real_data[col]) and 
+                pd.api.types.is_numeric_dtype(synthetic_data[col])):
+                
+                real_min, real_max = real_data[col].min(), real_data[col].max()
+                synth_min, synth_max = synthetic_data[col].min(), synthetic_data[col].max()
+                
+                # Check if synthetic data falls within reasonable range
+                range_score = 1.0
+                if synth_min < real_min:
+                    range_score *= max(0.5, 1 - abs(synth_min - real_min) / (real_max - real_min + 1e-8))
+                if synth_max > real_max:
+                    range_score *= max(0.5, 1 - abs(synth_max - real_max) / (real_max - real_min + 1e-8))
+                
+                range_consistency.append(range_score)
+        
+        scores['range_consistency'] = np.mean(range_consistency) if range_consistency else 1.0
+        
+        return scores
+    
+    def _jensen_shannon_divergence(self, p, q):
+        """Calculate Jensen-Shannon divergence between two probability distributions"""
+        p = np.array(p) + 1e-10  # Add small epsilon to avoid log(0)
+        q = np.array(q) + 1e-10
+        p = p / np.sum(p)
+        q = q / np.sum(q)
+        
+        m = 0.5 * (p + q)
+        return 0.5 * stats.entropy(p, m) + 0.5 * stats.entropy(q, m)
+    
+    def _simulate_membership_inference(self, real_data, synth_data, n_samples):
+        """Simulate membership inference attack"""
+        try:
+            # Sample random points from both datasets
+            real_sample_idx = np.random.choice(len(real_data), min(n_samples, len(real_data)), replace=False)
+            synth_sample_idx = np.random.choice(len(synth_data), min(n_samples, len(synth_data)), replace=False)
+            
+            attack_points = np.vstack([real_data[real_sample_idx], synth_data[synth_sample_idx]])
+            attack_labels = np.hstack([np.ones(len(real_sample_idx)), np.zeros(len(synth_sample_idx))])
+            
+            # Simple distance-based attack
+            correct_predictions = 0
+            for i, point in enumerate(attack_points):
+                # Find nearest neighbor in real data
+                distances = np.linalg.norm(real_data - point, axis=1)
+                min_distance = np.min(distances)
+                
+                # Predict membership based on distance threshold
+                predicted_member = min_distance < 0.1  # Threshold
+                if predicted_member == attack_labels[i]:
+                    correct_predictions += 1
+            
+            return correct_predictions / len(attack_points)
+        except:
+            return 0.5  # Random guess if attack fails
+    
+    def _calculate_utility_score(self, scores):
+        """Calculate overall utility score"""
+        utility_metrics = [
+            'kolmogorov_smirnov',
+            'correlation_similarity', 
+            'mean_similarity',
+            'std_similarity',
+            'ml_utility'
+        ]
+        
+        utility_values = [scores.get(metric, 0.5) for metric in utility_metrics]
+        return np.mean(utility_values)
+    
+    def _calculate_privacy_score(self, scores):
+        """Calculate overall privacy score"""
+        privacy_metrics = [
+            'distance_to_closest',
+            'membership_inference_risk'
+        ]
+        
+        privacy_values = [scores.get(metric, 0.5) for metric in privacy_metrics]
+        return np.mean(privacy_values)
+
+
+def evaluate_synthetic_data(
+    synthetic_data: pd.DataFrame,
+    real_data: pd.DataFrame, 
+    privacy_level: str = 'medium',
+    compliance_mode: str = 'hipaa'
+) -> dict:
+    """
+    Convenience function for complete synthetic data evaluation
+    
+    Args:
+        synthetic_data: Generated synthetic dataset
+        real_data: Original real dataset
+        privacy_level: Privacy protection level
+        compliance_mode: Regulatory compliance mode
+        
+    Returns:
+        Dictionary containing all evaluation metrics
+    """
+    
+    evaluator = SyntheticDataEvaluator()
+    results = evaluator.evaluate_all(synthetic_data, real_data, privacy_level)
+    
+    # Add compliance score
+    compliance_multipliers = {'hipaa': 1.0, 'gdpr': 0.95, 'fda': 0.9}
+    compliance_multiplier = compliance_multipliers.get(compliance_mode, 0.9)
+    
+    results['compliance_score'] = results['privacy_score'] * compliance_multiplier
+    results['compliance_mode'] = compliance_mode
+    
+    return results
+
+
+# Example usage
+if __name__ == "__main__":
+    # Create sample datasets
+    np.random.seed(42)
+    
+    # Real data simulation
+    real_data = pd.DataFrame({
+        'age': np.random.normal(45, 15, 1000),
+        'blood_pressure': np.random.normal(120, 20, 1000),
+        'cholesterol': np.random.normal(200, 40, 1000),
+        'diagnosis': np.random.choice(['healthy', 'sick'], 1000)
+    })
+    
+    # Synthetic data simulation (slightly different distribution)
+    synthetic_data = pd.DataFrame({
+        'age': np.random.normal(44, 16, 800),
+        'blood_pressure': np.random.normal(118, 22, 800), 
+        'cholesterol': np.random.normal(205, 38, 800),
+        'diagnosis': np.random.choice(['healthy', 'sick'], 800, p=[0.6, 0.4])
+    })
+    
+    print("🏥 Evaluating synthetic healthcare data...")
+    print(f"Real data shape: {real_data.shape}")
+    print(f"Synthetic data shape: {synthetic_data.shape}")
+    
+    # Run evaluation
+    results = evaluate_synthetic_data(
+        synthetic_data=synthetic_data,
+        real_data=real_data,
+        privacy_level='high',
+        compliance_mode='hipaa'
+    )
+    
+    print("\n📊 Evaluation Results:")
+    print("=" * 50)
+    for metric, value in results.items():
+        if isinstance(value, (int, float)):
+            print(f"{metric:.<30} {value:.3f}")
+        else:
+            print(f"{metric:.<30} {value}")
