@@ -1,0 +1,215 @@
+version: '3.8'
+
+services:
+  # Main application
+  synthetic-healthcare:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: synthetic-healthcare-app
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - LOG_LEVEL=info
+      - MAX_UPLOAD_SIZE=100MB
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./results:/app/results
+      - ./logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      - redis
+      - postgres
+    networks:
+      - synthetic-healthcare-network
+
+  # Development environment
+  synthetic-healthcare-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: synthetic-healthcare-dev
+    ports:
+      - "8000:8000"
+      - "8888:8888"  # Jupyter
+    environment:
+      - ENVIRONMENT=development
+      - LOG_LEVEL=debug
+    volumes:
+      - .:/app
+      - /app/.git
+    command: python api_server.py
+    profiles:
+      - dev
+    networks:
+      - synthetic-healthcare-network
+
+  # Redis for caching and session management
+  redis:
+    image: redis:7-alpine
+    container_name: synthetic-healthcare-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - synthetic-healthcare-network
+
+  # PostgreSQL for metadata and audit logs
+  postgres:
+    image: postgres:15-alpine
+    container_name: synthetic-healthcare-postgres
+    environment:
+      POSTGRES_DB: synthetic_healthcare
+      POSTGRES_USER: synthetic_user
+      POSTGRES_PASSWORD: synthetic_secure_password
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U synthetic_user -d synthetic_healthcare"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - synthetic-healthcare-network
+
+  # Nginx reverse proxy (for production)
+  nginx:
+    image: nginx:alpine
+    container_name: synthetic-healthcare-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/ssl/certs:ro
+      - ./nginx/logs:/var/log/nginx
+    depends_on:
+      - synthetic-healthcare
+    restart: unless-stopped
+    profiles:
+      - production
+    networks:
+      - synthetic-healthcare-network
+
+  # Monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: synthetic-healthcare-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    restart: unless-stopped
+    profiles:
+      - monitoring
+    networks:
+      - synthetic-healthcare-network
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: synthetic-healthcare-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=synthetic_admin_2024
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=http://localhost:3000/
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    profiles:
+      - monitoring
+    networks:
+      - synthetic-healthcare-network
+
+  # Model training worker (for background jobs)
+  training-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: synthetic-healthcare-worker
+    environment:
+      - ENVIRONMENT=production
+      - WORKER_MODE=true
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./results:/app/results
+    command: python -m src.workers.training_worker
+    depends_on:
+      - redis
+      - postgres
+    restart: unless-stopped
+    profiles:
+      - worker
+    networks:
+      - synthetic-healthcare-network
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  synthetic-healthcare-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# Useful docker-compose commands:
+#
+# Development:
+#   docker-compose --profile dev up -d
+#   docker-compose --profile dev logs -f synthetic-healthcare-dev
+#
+# Production:
+#   docker-compose --profile production up -d
+#   docker-compose --profile production --profile monitoring up -d
+#
+# Full stack with monitoring:
+#   docker-compose --profile production --profile monitoring --profile worker up -d
+#
+# Stop all services:
+#   docker-compose down
+#
+# View logs:
+#   docker-compose logs -f [service_name]
+#
+# Scale workers:
+#   docker-compose --profile worker up -d --scale training-worker=3
