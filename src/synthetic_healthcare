@@ -1,0 +1,323 @@
+"""
+Synthetic Healthcare Data Generator
+Main class for privacy-preserving synthetic medical data generation
+"""
+
+import torch
+import torch.nn as nn
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Optional, Tuple, Any
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+import warnings
+warnings.filterwarnings('ignore')
+
+class SyntheticDataGenerator:
+    """
+    Privacy-preserving synthetic healthcare data generator using GANs and VAEs
+    """
+    
+    def __init__(
+        self,
+        model_type: str = 'wgan-gp',
+        privacy_level: str = 'medium',
+        compliance_mode: str = 'hipaa',
+        random_state: int = 42
+    ):
+        """
+        Initialize the synthetic data generator
+        
+        Args:
+            model_type: Type of generative model ('wgan-gp', 'ctgan', 'beta-vae', 'med-gan')
+            privacy_level: Privacy protection level ('low', 'medium', 'high')
+            compliance_mode: Regulatory compliance ('hipaa', 'gdpr', 'fda')
+            random_state: Random seed for reproducibility
+        """
+        self.model_type = model_type
+        self.privacy_level = privacy_level
+        self.compliance_mode = compliance_mode
+        self.random_state = random_state
+        
+        # Set privacy parameters based on level
+        self.privacy_params = self._get_privacy_params()
+        
+        # Initialize components
+        self.scaler = StandardScaler()
+        self.label_encoders = {}
+        self.model = None
+        self.feature_info = {}
+        self.is_fitted = False
+        
+        # Set random seeds
+        torch.manual_seed(random_state)
+        np.random.seed(random_state)
+        
+    def _get_privacy_params(self) -> Dict[str, float]:
+        """Get privacy parameters based on privacy level"""
+        params = {
+            'low': {'epsilon': 10.0, 'delta': 1e-3},
+            'medium': {'epsilon': 1.0, 'delta': 1e-5},
+            'high': {'epsilon': 0.5, 'delta': 1e-6}
+        }
+        return params[self.privacy_level]
+    
+    def fit(self, data: pd.DataFrame, target_column: str = None, epochs: int = 100) -> 'SyntheticDataGenerator':
+        """
+        Train the synthetic data generator on medical data
+        
+        Args:
+            data: Input healthcare dataset
+            target_column: Name of target variable (optional)
+            epochs: Number of training epochs
+            
+        Returns:
+            Self (fitted generator)
+        """
+        print(f"🏥 Training {self.model_type.upper()} with {self.privacy_level} privacy...")
+        
+        # Preprocess data
+        processed_data, self.feature_info = self._preprocess_data(data, target_column)
+        
+        # Initialize model based on type
+        if self.model_type == 'wgan-gp':
+            from .models.wgan_gp import WGAN_GP
+            self.model = WGAN_GP(
+                input_dim=processed_data.shape[1],
+                privacy_params=self.privacy_params
+            )
+        elif self.model_type == 'ctgan':
+            from .models.ctgan import CTGAN
+            self.model = CTGAN(
+                privacy_params=self.privacy_params
+            )
+        elif self.model_type == 'beta-vae':
+            from .models.beta_vae import BetaVAE
+            self.model = BetaVAE(
+                input_dim=processed_data.shape[1],
+                privacy_params=self.privacy_params
+            )
+        else:
+            raise ValueError(f"Unsupported model type: {self.model_type}")
+        
+        # Train the model
+        self.model.fit(processed_data, epochs=epochs)
+        self.is_fitted = True
+        
+        print(f"✅ Training completed! Model ready for generation.")
+        return self
+    
+    def generate(self, n_samples: int = 1000) -> pd.DataFrame:
+        """
+        Generate synthetic healthcare data
+        
+        Args:
+            n_samples: Number of synthetic samples to generate
+            
+        Returns:
+            Synthetic healthcare dataset
+        """
+        if not self.is_fitted:
+            raise ValueError("Generator must be fitted before generating data")
+        
+        print(f"🔬 Generating {n_samples} synthetic healthcare records...")
+        
+        # Generate synthetic data
+        synthetic_data = self.model.generate(n_samples)
+        
+        # Post-process back to original format
+        synthetic_df = self._postprocess_data(synthetic_data)
+        
+        # Apply privacy post-processing
+        synthetic_df = self._apply_privacy_postprocessing(synthetic_df)
+        
+        print(f"✅ Generated {len(synthetic_df)} synthetic records")
+        return synthetic_df
+    
+    def generate_conditional(
+        self, 
+        conditions: Dict[str, Any], 
+        n_samples: int = 1000
+    ) -> pd.DataFrame:
+        """
+        Generate synthetic data with specific conditions
+        
+        Args:
+            conditions: Dictionary of column-value conditions
+            n_samples: Number of samples to generate
+            
+        Returns:
+            Conditional synthetic dataset
+        """
+        if not hasattr(self.model, 'generate_conditional'):
+            raise ValueError(f"{self.model_type} doesn't support conditional generation")
+        
+        synthetic_data = self.model.generate_conditional(conditions, n_samples)
+        return self._postprocess_data(synthetic_data)
+    
+    def evaluate(self, synthetic_data: pd.DataFrame, real_data: pd.DataFrame) -> Dict[str, float]:
+        """
+        Evaluate synthetic data quality and privacy
+        
+        Args:
+            synthetic_data: Generated synthetic data
+            real_data: Original real data
+            
+        Returns:
+            Dictionary of evaluation metrics
+        """
+        from .evaluation.metrics import evaluate_synthetic_data
+        
+        results = evaluate_synthetic_data(
+            synthetic_data=synthetic_data,
+            real_data=real_data,
+            privacy_level=self.privacy_level,
+            compliance_mode=self.compliance_mode
+        )
+        
+        return results
+    
+    def _preprocess_data(self, data: pd.DataFrame, target_column: str = None) -> Tuple[np.ndarray, Dict]:
+        """Preprocess healthcare data for training"""
+        
+        # Store feature information
+        feature_info = {
+            'columns': list(data.columns),
+            'categorical_columns': [],
+            'numerical_columns': [],
+            'target_column': target_column,
+            'dtypes': dict(data.dtypes)
+        }
+        
+        processed_data = data.copy()
+        
+        # Handle categorical variables
+        for col in processed_data.columns:
+            if processed_data[col].dtype == 'object' or processed_data[col].nunique() < 10:
+                feature_info['categorical_columns'].append(col)
+                le = LabelEncoder()
+                processed_data[col] = le.fit_transform(processed_data[col].astype(str))
+                self.label_encoders[col] = le
+            else:
+                feature_info['numerical_columns'].append(col)
+        
+        # Normalize numerical features
+        if feature_info['numerical_columns']:
+            processed_data[feature_info['numerical_columns']] = self.scaler.fit_transform(
+                processed_data[feature_info['numerical_columns']]
+            )
+        
+        return processed_data.values, feature_info
+    
+    def _postprocess_data(self, synthetic_data: np.ndarray) -> pd.DataFrame:
+        """Convert generated data back to original format"""
+        
+        # Create DataFrame
+        synthetic_df = pd.DataFrame(synthetic_data, columns=self.feature_info['columns'])
+        
+        # Denormalize numerical features
+        if self.feature_info['numerical_columns']:
+            synthetic_df[self.feature_info['numerical_columns']] = self.scaler.inverse_transform(
+                synthetic_df[self.feature_info['numerical_columns']]
+            )
+        
+        # Decode categorical variables
+        for col in self.feature_info['categorical_columns']:
+            # Round to integers for categorical data
+            synthetic_df[col] = synthetic_df[col].round().astype(int)
+            
+            # Clip to valid range
+            min_val, max_val = 0, len(self.label_encoders[col].classes_) - 1
+            synthetic_df[col] = synthetic_df[col].clip(min_val, max_val)
+            
+            # Apply inverse transform
+            synthetic_df[col] = self.label_encoders[col].inverse_transform(synthetic_df[col])
+        
+        return synthetic_df
+    
+    def _apply_privacy_postprocessing(self, data: pd.DataFrame) -> pd.DataFrame:
+        """Apply additional privacy protection measures"""
+        
+        if self.privacy_level == 'high':
+            # Add small amount of noise to numerical columns
+            for col in self.feature_info['numerical_columns']:
+                noise_scale = data[col].std() * 0.01
+                noise = np.random.laplace(0, noise_scale, size=len(data))
+                data[col] += noise
+        
+        return data
+    
+    def save_model(self, filepath: str) -> None:
+        """Save the trained model"""
+        import pickle
+        
+        model_data = {
+            'model': self.model,
+            'scaler': self.scaler,
+            'label_encoders': self.label_encoders,
+            'feature_info': self.feature_info,
+            'model_type': self.model_type,
+            'privacy_level': self.privacy_level,
+            'compliance_mode': self.compliance_mode
+        }
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(model_data, f)
+        
+        print(f"💾 Model saved to {filepath}")
+    
+    def load_model(self, filepath: str) -> 'SyntheticDataGenerator':
+        """Load a trained model"""
+        import pickle
+        
+        with open(filepath, 'rb') as f:
+            model_data = pickle.load(f)
+        
+        self.model = model_data['model']
+        self.scaler = model_data['scaler']
+        self.label_encoders = model_data['label_encoders']
+        self.feature_info = model_data['feature_info']
+        self.model_type = model_data['model_type']
+        self.privacy_level = model_data['privacy_level']
+        self.compliance_mode = model_data['compliance_mode']
+        self.is_fitted = True
+        
+        print(f"📂 Model loaded from {filepath}")
+        return self
+
+
+# Example usage
+if __name__ == "__main__":
+    # Load sample healthcare data
+    from sklearn.datasets import load_breast_cancer
+    
+    # Create sample medical dataset
+    data = load_breast_cancer()
+    df = pd.DataFrame(data.data, columns=data.feature_names)
+    df['diagnosis'] = data.target
+    
+    print("🏥 Sample Healthcare Data:")
+    print(df.head())
+    print(f"Shape: {df.shape}")
+    
+    # Initialize generator
+    generator = SyntheticDataGenerator(
+        model_type='wgan-gp',
+        privacy_level='high',
+        compliance_mode='hipaa'
+    )
+    
+    # Train the model
+    generator.fit(df, target_column='diagnosis', epochs=50)
+    
+    # Generate synthetic data
+    synthetic_data = generator.generate(n_samples=100)
+    
+    print("\n🔬 Synthetic Healthcare Data:")
+    print(synthetic_data.head())
+    
+    # Evaluate quality
+    results = generator.evaluate(synthetic_data, df)
+    print(f"\n📊 Evaluation Results:")
+    for metric, value in results.items():
+        print(f"  {metric}: {value:.3f}")
